@@ -96,3 +96,4 @@ so adding a flow there is enough — no runner change needed.
 - iOS is intentionally not wired up here (its simulator build is currently
   blocked by GoogleMLKit's missing arm64-simulator slice — see the app repo).
 # qt
+# qt
