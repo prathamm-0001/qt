@@ -860,3 +860,24 @@ a.hist-xlsx:hover {
     flex-wrap: wrap;
   }
 }
+
+/* ---- backend URL: "connect" card + header pill ---- */
+.connect h2 {
+  font-size: 17px;
+  margin: 0 0 6px;
+}
+.connect .sub {
+  max-width: none;
+}
+.connect input.name {
+  flex: 1 1 260px;
+  max-width: none;
+}
+button.pill {
+  font-family: inherit;
+  cursor: pointer;
+}
+button.pill:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
+}

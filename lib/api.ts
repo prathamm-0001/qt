@@ -1,5 +1,41 @@
-export const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
+// The test Mac's backend (:4000) sits behind a Cloudflare quick tunnel whose
+// URL changes every time the tunnel restarts. Rather than baking it into the
+// build (a redeploy per restart), the site asks for it, checks it answers, and
+// keeps it in this browser's localStorage. The Mac publishes its current URL to
+// ~/Desktop/qoneqt-backend-url.txt (scripts/auto-tunnel.sh).
+const BACKEND_KEY = "qoneqt.backendUrl";
+let backendUrl: string | null = null;
+
+export function getBackendUrl(): string | null {
+  if (backendUrl === null) {
+    try {
+      backendUrl = localStorage.getItem(BACKEND_KEY);
+    } catch {}
+  }
+  return backendUrl;
+}
+
+export function saveBackendUrl(url: string | null) {
+  backendUrl = url;
+  try {
+    if (url) localStorage.setItem(BACKEND_KEY, url);
+    else localStorage.removeItem(BACKEND_KEY);
+  } catch {}
+}
+
+/** What a tester pasted ("abc.trycloudflare.com/", ".../api/health") as an origin, or null. */
+export function normalizeBackendUrl(input: string): string | null {
+  let s = input.trim();
+  if (!s) return null;
+  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+  try {
+    return new URL(s).origin;
+  } catch {
+    return null;
+  }
+}
+
+const api = (p: string) => `${getBackendUrl()}${p}`;
 
 export type FlowStatus = "COMPLETED" | "FAILED" | "SKIPPED" | "WARNED";
 export type Platform = "android" | "ios";
@@ -16,7 +52,7 @@ export interface Flow {
 }
 
 export function shotUrl(runId: string, file: string): string {
-  return `${BACKEND_URL}/api/runs/${runId}/shot/${file}`;
+  return api(`/api/runs/${runId}/shot/${file}`);
 }
 
 export interface RunSnapshot {
@@ -118,7 +154,7 @@ export function uploadBuild(
 ): { promise: Promise<string>; abort: () => void } {
   const xhr = new XMLHttpRequest();
   const promise = new Promise<string>((resolve, reject) => {
-    xhr.open("POST", `${BACKEND_URL}/api/runs`);
+    xhr.open("POST", api("/api/runs"));
     xhr.responseType = "json";
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(e.loaded, e.total);
@@ -139,8 +175,8 @@ export function uploadBuild(
     xhr.onerror = () =>
       reject(
         new UploadError(
-          "Couldn't reach the test machine. Its tunnel may be restarting — " +
-            "this page picks up the new address automatically; try again in a minute.",
+          "Couldn't reach the test machine. If its tunnel restarted it has a new " +
+            "URL — ask the tester for it and use “Change” at the top of the page.",
           0,
         ),
       );
@@ -154,7 +190,7 @@ export function uploadBuild(
 }
 
 export async function fetchRun(runId: string): Promise<RunSnapshot> {
-  const res = await fetch(`${BACKEND_URL}/api/runs/${runId}`, {
+  const res = await fetch(api(`/api/runs/${runId}`), {
     cache: "no-store",
   });
   if (res.status === 404) throw new RunGoneError("run not found");
@@ -164,37 +200,41 @@ export async function fetchRun(runId: string): Promise<RunSnapshot> {
 
 /** All past and current runs, newest first. */
 export async function fetchHistory(): Promise<RunSummary[]> {
-  const res = await fetch(`${BACKEND_URL}/api/runs`, { cache: "no-store" });
+  const res = await fetch(api("/api/runs"), { cache: "no-store" });
   if (!res.ok) throw new Error(`history ${res.status}`);
   return res.json();
 }
 
-export async function fetchHealth(): Promise<Health> {
+/** GET /api/health on `base` (the saved backend by default). */
+export async function fetchHealth(base = getBackendUrl()): Promise<Health> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch(`${BACKEND_URL}/api/health`, {
+    const res = await fetch(`${base}/api/health`, {
       cache: "no-store",
       signal: ctrl.signal,
     });
     if (!res.ok) throw new Error(`health ${res.status}`);
-    return res.json();
+    const h = await res.json();
+    // Something answered - make sure it's actually the test-runner backend.
+    if (!h?.ok || !h.platforms) throw new Error("not the test-runner backend");
+    return h;
   } finally {
     clearTimeout(t);
   }
 }
 
 export async function cancelRun(runId: string): Promise<void> {
-  const res = await fetch(`${BACKEND_URL}/api/runs/${runId}/cancel`, {
+  const res = await fetch(api(`/api/runs/${runId}/cancel`), {
     method: "POST",
   });
   if (!res.ok) throw new Error(`cancel ${res.status}`);
 }
 
 export function reportUrl(runId: string): string {
-  return `${BACKEND_URL}/api/runs/${runId}/report`;
+  return api(`/api/runs/${runId}/report`);
 }
 
 export function streamUrl(runId: string): string {
-  return `${BACKEND_URL}/api/runs/${runId}/stream`;
+  return api(`/api/runs/${runId}/stream`);
 }

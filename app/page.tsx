@@ -6,7 +6,10 @@ import {
   fetchHealth,
   fetchHistory,
   fetchRun,
+  getBackendUrl,
+  normalizeBackendUrl,
   reportUrl,
+  saveBackendUrl,
   shotUrl,
   uploadBuild,
   RunGoneError,
@@ -50,7 +53,6 @@ const HISTORY_PAGE = 10;
 // Cloudflare's free quick tunnel rejects request bodies above ~100 MB.
 const TUNNEL_LIMIT_MB = 100;
 const RUN_KEY = "qoneqt.runId";
-const RELOAD_KEY = "qoneqt.lastAutoReload";
 const NAME_KEY = "qoneqt.testerName";
 const MY_RUNS_KEY = "qoneqt.myRuns";
 
@@ -128,18 +130,21 @@ function recalledRun(): string | null {
   }
 }
 
-// Polls /api/health. `online` is null until the first answer.
-function useHealth(pauseReload: () => boolean) {
+// Polls /api/health on `base`. `online` is null until the first answer.
+function useHealth(base: string | null | undefined) {
   const [health, setHealth] = useState<Health | null>(null);
   const [online, setOnline] = useState<boolean | null>(null);
   useEffect(() => {
+    setHealth(null);
+    setOnline(null);
+    if (!base) return;
     let stop = false;
     let fails = 0;
     let timer: ReturnType<typeof setTimeout>;
     let busy = false;
     const tick = async () => {
       try {
-        const h = await fetchHealth();
+        const h = await fetchHealth(base);
         if (stop) return;
         setHealth(h);
         setOnline(true);
@@ -149,19 +154,6 @@ function useHealth(pauseReload: () => boolean) {
         if (stop) return;
         fails += 1;
         if (fails >= 2) setOnline(false);
-        // The tunnel URL changes when the Mac restarts it, and the site is
-        // redeployed with the new one. Reload (at most every 2 min) to pick
-        // up that redeploy instead of staying stuck on a dead address.
-        if (fails >= 4 && !pauseReload()) {
-          try {
-            const last = Number(sessionStorage.getItem(RELOAD_KEY) || 0);
-            if (Date.now() - last > 120_000) {
-              sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
-              window.location.reload();
-              return;
-            }
-          } catch {}
-        }
       }
       // Poll faster while someone's session is running so waiting testers see
       // the Mac free up promptly.
@@ -172,9 +164,18 @@ function useHealth(pauseReload: () => boolean) {
       stop = true;
       clearTimeout(timer);
     };
-  }, [pauseReload]);
+  }, [base]);
   return { health, online };
 }
+
+/** The tunnel's host, e.g. "rom-arkansas-voluntary-uploaded". */
+const shortHost = (url: string) => {
+  try {
+    return new URL(url).hostname.replace(/\.trycloudflare\.com$/, "");
+  } catch {
+    return url;
+  }
+};
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -202,9 +203,18 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const uploadRef = useRef<{ abort: () => void } | null>(null);
 
+  // The backend URL this browser talks to: undefined until it's been read from
+  // storage, null while the page asks for one.
+  const [backend, setBackend] = useState<string | null | undefined>(undefined);
+  const [ask, setAsk] = useState<{ initial: string; autoCheck: boolean; stale: string | null }>({
+    initial: "",
+    autoCheck: false,
+    stale: null,
+  });
+  const wasOnline = useRef(false);
+
   const uploading = progress !== null;
-  const pauseReload = useCallback(() => uploadRef.current !== null, []);
-  const { health, online } = useHealth(pauseReload);
+  const { health, online } = useHealth(backend);
 
   const terminal =
     run?.status === "passed" || run?.status === "failed" || run?.status === "error";
@@ -212,6 +222,49 @@ export default function Home() {
   // Someone else's session occupying the Mac (only one runs at a time).
   const active: ActiveSession | null = health?.active ?? null;
   const othersSession = active && active.id !== runId ? active : null;
+
+  // Which backend to talk to: a ?backend= link from the tester is checked first
+  // (and dropped from the address bar), else the URL this browser saved last
+  // time. With neither, the page asks for one.
+  useEffect(() => {
+    let link: string | null = null;
+    try {
+      const url = new URL(window.location.href);
+      link = url.searchParams.get("backend");
+      if (link) {
+        url.searchParams.delete("backend");
+        window.history.replaceState(null, "", url);
+      }
+    } catch {}
+    if (link) {
+      setAsk({ initial: link, autoCheck: true, stale: null });
+      setBackend(null);
+    } else {
+      setBackend(getBackendUrl());
+    }
+  }, []);
+
+  // A saved URL that never answers belongs to an old tunnel - ask for the new
+  // one. Once it has answered, a later outage only shows the banner (the tunnel
+  // may just be blipping, and a run in progress shouldn't be thrown away).
+  useEffect(() => {
+    if (online) wasOnline.current = true;
+    else if (online === false && backend && !wasOnline.current) {
+      setAsk({ initial: "", autoCheck: false, stale: backend });
+      setBackend(null);
+    }
+  }, [online, backend]);
+
+  const connect = useCallback((url: string) => {
+    saveBackendUrl(url);
+    wasOnline.current = true; // ConnectCard just checked it
+    setBackend(url);
+  }, []);
+
+  const changeBackend = () => {
+    setAsk({ initial: "", autoCheck: false, stale: null });
+    setBackend(null);
+  };
 
   // Reopen a run from ?run= / localStorage on load; restore the tester name.
   useEffect(() => {
@@ -436,16 +489,16 @@ export default function Home() {
   const upEta =
     upRate > 0 && progress ? (progress.total - progress.loaded) / upRate : null;
 
-  return (
-    <div className="wrap">
-      <header className="top">
-        <div>
-          <h1>Qoneqt Test Runner</h1>
-          <p className="sub">
-            Drop an Android or iOS build — it installs on the Mac Mini and every
-            Maestro flow runs live below, with an Excel report at the end.
-          </p>
-        </div>
+  const header = (
+    <header className="top">
+      <div>
+        <h1>Qoneqt Test Runner</h1>
+        <p className="sub">
+          Drop an Android or iOS build — it installs on the Mac Mini and every
+          Maestro flow runs live below, with an Excel report at the end.
+        </p>
+      </div>
+      {backend !== null && (
         <div className="health" aria-live="polite">
           <span className={`pill ${online === null ? "unk" : online ? "on" : "off"}`}>
             <i className="led" />
@@ -477,19 +530,45 @@ export default function Home() {
               </span>
             </>
           )}
+          {backend && (
+            <button
+              className="pill"
+              title={`Backend: ${backend}`}
+              disabled={uploading}
+              onClick={changeBackend}
+            >
+              {shortHost(backend)} · Change
+            </button>
+          )}
         </div>
-      </header>
+      )}
+    </header>
+  );
+
+  if (!backend)
+    return (
+      <div className="wrap">
+        {header}
+        {backend === null && (
+          <ConnectCard key={ask.stale ?? ask.initial} {...ask} onConnect={connect} />
+        )}
+      </div>
+    );
+
+  return (
+    <div className="wrap">
+      {header}
 
       {online === false && (
         <div className="banner">
           <span className="spinner" />
           <div>
-            <b>Can&apos;t reach the test machine.</b> Its tunnel is probably
-            restarting — the site is redeployed with the new address
-            automatically, and this page reloads itself to pick it up.
+            <b>Can&apos;t reach the test machine.</b> If its tunnel restarted it
+            has a new URL — ask the tester (the Mac writes it to
+            qoneqt-backend-url.txt on its Desktop). This page keeps retrying.
           </div>
-          <button className="ghost small" onClick={() => window.location.reload()}>
-            Reload now
+          <button className="ghost small" onClick={changeBackend}>
+            Enter new URL
           </button>
         </div>
       )}
@@ -902,6 +981,92 @@ export default function Home() {
         </div>
       )}
     </div>
+  );
+}
+
+// Asks for the backend URL, checks /api/health answers there, then hands it up
+// to be saved in this browser.
+function ConnectCard({
+  initial,
+  autoCheck,
+  stale,
+  onConnect,
+}: {
+  initial: string;
+  autoCheck: boolean;
+  stale: string | null;
+  onConnect: (url: string) => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const [checking, setChecking] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const check = useCallback(
+    async (input: string) => {
+      const url = normalizeBackendUrl(input);
+      if (!url) {
+        setErr("That doesn't look like a URL.");
+        return;
+      }
+      setChecking(true);
+      setErr(null);
+      try {
+        await fetchHealth(url);
+        onConnect(url);
+      } catch {
+        setErr(
+          `The test-runner backend didn't answer at ${url}. Check you have the ` +
+            `latest URL — it changes every time the Mac's tunnel restarts.`,
+        );
+        setChecking(false);
+      }
+    },
+    [onConnect],
+  );
+
+  // A ?backend= link: check it straight away.
+  useEffect(() => {
+    if (autoCheck && initial) check(initial);
+  }, [autoCheck, initial, check]);
+
+  return (
+    <form
+      className="card connect"
+      onSubmit={(e) => {
+        e.preventDefault();
+        check(value);
+      }}
+    >
+      <h2>Connect to the test Mac</h2>
+      <p className="sub">
+        Paste the backend URL the tester gave you (on the Mac it&apos;s in{" "}
+        <b>qoneqt-backend-url.txt</b> on the Desktop). It&apos;s saved in this
+        browser, so you only need a new one when the Mac&apos;s tunnel restarts.
+      </p>
+      {stale && (
+        <div className="warn">
+          The saved URL ({shortHost(stale)}) isn&apos;t answering — the tunnel has
+          probably restarted with a new one.
+        </div>
+      )}
+      <div className="actions">
+        <input
+          className="name"
+          type="text"
+          inputMode="url"
+          placeholder="https://….trycloudflare.com"
+          aria-label="Backend URL"
+          autoFocus
+          value={value}
+          disabled={checking}
+          onChange={(e) => setValue(e.target.value)}
+        />
+        <button className="primary" disabled={checking || !value.trim()}>
+          {checking ? "Checking…" : "Connect"}
+        </button>
+      </div>
+      {err && <div className="error">{err}</div>}
+    </form>
   );
 }
 
